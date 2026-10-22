@@ -1,9 +1,9 @@
-name: Build test image (vfo1-foundation)
+name: Build test image (smtp-oauth2)
 
 on:
   workflow_dispatch:
   push:
-    branches: [feature/vfo1-foundation-flag]
+    branches: [test/smtp-oauth2-vfo1]
 
 permissions:
   contents: read
@@ -28,7 +28,8 @@ jobs:
           push: true
           build-args: |
             DB=sqlite,mysql,postgresql
+            VW_VERSION=${{ github.sha }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/vaultwarden:1.37.4-vfo1
+            ghcr.io/${{ github.repository_owner }}/vaultwarden:smtp-oauth2-vfo1
           cache-from: type=gha
           cache-to: type=gha,mode=max
