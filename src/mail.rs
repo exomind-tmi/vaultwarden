@@ -30,7 +30,99 @@ fn sendmail_transport() -> AsyncSendmailTransport<Tokio1Executor> {
     }
 }
 
-fn smtp_transport() -> AsyncSmtpTransport<Tokio1Executor> {
+/// OAuth2 access token for SMTP XOAUTH2 authentication
+struct SmtpOAuth2Token {
+    /// The settings the token was issued for
+    issued_for: String,
+    access_token: String,
+    expires_at: std::time::Instant,
+}
+
+static SMTP_OAUTH2_TOKEN: std::sync::LazyLock<tokio::sync::Mutex<Option<SmtpOAuth2Token>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+/// Tokens are renewed this long before they actually expire.
+const SMTP_OAUTH2_EXPIRY_MARGIN: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[derive(serde::Deserialize)]
+struct OAuth2TokenResponse {
+    access_token: String,
+    expires_in: Option<u64>,
+}
+
+/// Returns a valid OAuth2 access token for SMTP, requesting a new one from `SMTP_OAUTH2_TOKEN_URL` when needed.
+///
+/// Uses the `refresh_token` grant when `SMTP_OAUTH2_REFRESH_TOKEN` is set (delegated access, e.g. Gmail),
+/// otherwise the `client_credentials` grant (app-only access, e.g. Microsoft 365 with `SMTP.SendAsApp`).
+async fn smtp_oauth2_access_token(token_url: &str) -> Result<String, Error> {
+    use std::time::{Duration, Instant};
+
+    let client_id = CONFIG.smtp_oauth2_client_id().unwrap_or_default();
+    let client_secret = CONFIG.smtp_oauth2_client_secret();
+    let scope = CONFIG.smtp_oauth2_scope();
+    let refresh_token = CONFIG.smtp_oauth2_refresh_token();
+
+    // The settings can be changed in the admin panel, so only reuse a token that was issued for the current ones.
+    let settings = format!("{token_url}\n{client_id}\n{client_secret:?}\n{scope:?}\n{refresh_token:?}");
+
+    let mut cached = SMTP_OAUTH2_TOKEN.lock().await;
+    if let Some(token) = cached.as_ref()
+        && token.issued_for == settings
+        && Instant::now() + SMTP_OAUTH2_EXPIRY_MARGIN < token.expires_at
+    {
+        return Ok(token.access_token.clone());
+    }
+
+    let mut form: Vec<(&str, String)> = vec![("client_id", client_id)];
+    if let Some(secret) = client_secret {
+        form.push(("client_secret", secret));
+    }
+    if let Some(refresh_token) = refresh_token {
+        form.push(("grant_type", "refresh_token".to_owned()));
+        form.push(("refresh_token", refresh_token));
+    } else {
+        form.push(("grant_type", "client_credentials".to_owned()));
+    }
+    if let Some(scope) = scope {
+        form.push(("scope", scope));
+    }
+
+    // The token URL is set by the admin, so it is not subject to HTTP_REQUEST_BLOCK_* restrictions (same as SSO).
+    let client = crate::http_client::get_reqwest_client_builder(false)
+        .timeout(Duration::from_secs(u64::from(CONFIG.smtp_timeout())))
+        .build()?;
+
+    let response = match client.post(token_url).form(&form).send().await {
+        Ok(r) => r,
+        Err(e) => err!(format!("SMTP OAuth2 token request failed: {e}")),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        debug!("SMTP OAuth2 token endpoint response: {body}");
+        err!(format!("SMTP OAuth2 token request failed with HTTP {status}"));
+    }
+    let token: OAuth2TokenResponse = match response.json().await {
+        Ok(t) => t,
+        Err(e) => err!(format!("SMTP OAuth2 token response could not be parsed: {e}")),
+    };
+
+    // Default to one hour when the provider doesn't say, which is the common lifetime.
+    let expires_at = Instant::now() + Duration::from_secs(token.expires_in.unwrap_or(3600));
+    *cached = Some(SmtpOAuth2Token {
+        issued_for: settings,
+        access_token: token.access_token.clone(),
+        expires_at,
+    });
+    Ok(token.access_token)
+}
+
+/// Drops the cached SMTP OAuth2 token, so the next send requests a fresh one.
+async fn invalidate_smtp_oauth2_token() {
+    *SMTP_OAUTH2_TOKEN.lock().await = None;
+}
+
+async fn smtp_transport() -> Result<AsyncSmtpTransport<Tokio1Executor>, Error> {
     use std::time::Duration;
     let host = CONFIG.smtp_host().unwrap();
 
@@ -58,9 +150,16 @@ fn smtp_transport() -> AsyncSmtpTransport<Tokio1Executor> {
         }
     };
 
-    let smtp_client = match (CONFIG.smtp_username(), CONFIG.smtp_password()) {
-        (Some(user), Some(pass)) => smtp_client.credentials(Credentials::new(user, pass)),
-        _ => smtp_client,
+    let smtp_client = if let Some(token_url) = CONFIG.smtp_oauth2_token_url() {
+        // With OAuth2 the access token is used as the credential and XOAUTH2 is the only usable mechanism
+        let user = CONFIG.smtp_username().unwrap_or_default();
+        let token = smtp_oauth2_access_token(&token_url).await?;
+        smtp_client.credentials(Credentials::new(user, token)).authentication(vec![SmtpAuthMechanism::Xoauth2])
+    } else {
+        match (CONFIG.smtp_username(), CONFIG.smtp_password()) {
+            (Some(user), Some(pass)) => smtp_client.credentials(Credentials::new(user, pass)),
+            _ => smtp_client,
+        }
     };
 
     let smtp_client = match CONFIG.helo_name() {
@@ -68,7 +167,7 @@ fn smtp_transport() -> AsyncSmtpTransport<Tokio1Executor> {
         None => smtp_client,
     };
 
-    let smtp_client = match CONFIG.smtp_auth_mechanism() {
+    let smtp_client = match CONFIG.smtp_auth_mechanism().filter(|_| CONFIG.smtp_oauth2_token_url().is_none()) {
         Some(mechanism) => {
             let allowed_mechanisms = [SmtpAuthMechanism::Plain, SmtpAuthMechanism::Login, SmtpAuthMechanism::Xoauth2];
             let mut selected_mechanisms = vec![];
@@ -93,7 +192,7 @@ fn smtp_transport() -> AsyncSmtpTransport<Tokio1Executor> {
         _ => smtp_client,
     };
 
-    smtp_client.build()
+    Ok(smtp_client.build())
 }
 
 // This will sanitize the string values by stripping all the html tags to prevent XSS and HTML Injections
@@ -702,7 +801,7 @@ async fn send_with_selected_transport(email: Message) -> EmptyResult {
             }
         }
     } else {
-        match smtp_transport().send(email).await {
+        match smtp_transport().await?.send(email).await {
             Ok(_) => Ok(()),
             // Match some common errors and make them more user friendly
             Err(e) => {
@@ -718,6 +817,10 @@ async fn send_with_selected_transport(email: Message) -> EmptyResult {
                     // Add a special check for 535 to add a more descriptive message
                     if msg.contains("(535)") {
                         msg = format!("{msg} - Authentication credentials invalid");
+                        if CONFIG.smtp_oauth2_token_url().is_some() {
+                            // The token might have been revoked, request a new one next time
+                            invalidate_smtp_oauth2_token().await;
+                        }
                     }
                     err!(format!("SMTP 5xx error: {msg}"));
                 } else if e.is_timeout() {
