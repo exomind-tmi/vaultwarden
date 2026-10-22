@@ -1,9 +1,9 @@
-name: Build test image (smtp-oauth2)
+name: Build develop image
 
 on:
   workflow_dispatch:
   push:
-    branches: [test/smtp-oauth2-vfo1]
+    branches: [develop]
 
 permissions:
   contents: read
@@ -30,6 +30,6 @@ jobs:
             DB=sqlite,mysql,postgresql
             VW_VERSION=${{ github.sha }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/vaultwarden:smtp-oauth2-vfo1
+            ghcr.io/${{ github.repository_owner }}/vaultwarden:develop
           cache-from: type=gha
           cache-to: type=gha,mode=max
