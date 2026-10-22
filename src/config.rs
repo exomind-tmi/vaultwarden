@@ -448,6 +448,8 @@ macro_rules! make_config {
                     "smtp_from",
                     "smtp_host",
                     "smtp_username",
+                    "smtp_oauth2_token_url",
+                    "smtp_oauth2_client_id",
                     "sso_authority",
                     "sso_callback_path",
                     "sso_client_id",
@@ -902,6 +904,16 @@ make_config! {
         smtp_password:                 Pass,   true,   option;
         /// SMTP Auth mechanism |> Defaults for SSL is "Plain" and "Login" and nothing for Non-SSL connections. Possible values: ["Plain", "Login", "Xoauth2"]. Multiple options need to be separated by a comma ','.
         smtp_auth_mechanism:           String, true,   option;
+        /// SMTP OAuth2 token URL |> Enables OAuth2 (XOAUTH2) authentication. Vaultwarden requests access tokens from this endpoint and refreshes them automatically. SMTP_USERNAME is the mailbox to authenticate as; SMTP_PASSWORD must not be set.
+        smtp_oauth2_token_url:         String, true,   option;
+        /// SMTP OAuth2 client ID
+        smtp_oauth2_client_id:         String, true,   option;
+        /// SMTP OAuth2 client secret
+        smtp_oauth2_client_secret:     Pass,   true,   option;
+        /// SMTP OAuth2 scope |> e.g. "https://outlook.office365.com/.default" for Microsoft 365 or "https://mail.google.com/" for Google
+        smtp_oauth2_scope:             String, true,   option;
+        /// SMTP OAuth2 refresh token |> If set, the refresh_token grant is used (delegated access). Otherwise the client_credentials grant is used (app-only access, e.g. Microsoft 365).
+        smtp_oauth2_refresh_token:     Pass,   true,   option;
         /// SMTP connection timeout |> Number of seconds when to stop trying to connect to the SMTP server
         smtp_timeout:                  u64,    true,   def,     15;
         /// Server name sent during HELO |> By default this value should be the machine's hostname, but might need to be changed in case it trips some anti-spam filters
@@ -1171,7 +1183,25 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
                 err!("Both `SMTP_HOST` and `SMTP_FROM` need to be set for email support without `USE_SENDMAIL`")
             }
 
-            if cfg.smtp_username.is_some() != cfg.smtp_password.is_some() {
+            if cfg.smtp_oauth2_token_url.is_some() {
+                if cfg.smtp_username.is_none() {
+                    err!("`SMTP_USERNAME` needs to be set to the mailbox address when using `SMTP_OAUTH2_TOKEN_URL`")
+                }
+                if cfg.smtp_password.is_some() {
+                    err!("`SMTP_PASSWORD` can't be used together with `SMTP_OAUTH2_TOKEN_URL`")
+                }
+                if cfg.smtp_oauth2_client_id.is_none() {
+                    err!("`SMTP_OAUTH2_CLIENT_ID` needs to be set when using `SMTP_OAUTH2_TOKEN_URL`")
+                }
+                if cfg.smtp_oauth2_refresh_token.is_none() && cfg.smtp_oauth2_client_secret.is_none() {
+                    err!(
+                        "`SMTP_OAUTH2_CLIENT_SECRET` is required for the client credentials grant (no `SMTP_OAUTH2_REFRESH_TOKEN` set)"
+                    )
+                }
+                if !cfg.smtp_oauth2_token_url.as_deref().unwrap_or_default().starts_with("https://") {
+                    err!("`SMTP_OAUTH2_TOKEN_URL` must be an https:// URL")
+                }
+            } else if cfg.smtp_username.is_some() != cfg.smtp_password.is_some() {
                 err!(
                     "Both `SMTP_USERNAME` and `SMTP_PASSWORD` need to be set to enable email authentication without `USE_SENDMAIL`"
                 )
