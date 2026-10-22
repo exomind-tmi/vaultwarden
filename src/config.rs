@@ -1489,6 +1489,7 @@ pub const SUPPORTED_FEATURE_FLAGS: &[&str] = &[
     "pm-30529-webauthn-related-origins",
     // Vault Team
     "pm-32009-new-item-types",
+    "vfo1-foundation",
 ];
 
 #[derive(Clone, Copy, Serialize)]
